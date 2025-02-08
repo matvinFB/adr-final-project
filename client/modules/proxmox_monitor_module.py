@@ -22,21 +22,19 @@ class ProxmoxMonitor:
     def get_usage(self):
         """
         Fetch the CPU and RAM usage from Proxmox API.
-        
+
         :return: Dictionary with CPU (%) and RAM (MB) usage
         """
         url = f"{self.proxmox_url}/api2/json/nodes/{self.node}/qemu/{self.vm_id}/status/current"
-        
+
         try:
             response = requests.get(url, headers=self.headers, verify=False, timeout=5)
-            
+
             if response.status_code == 200:
                 data = response.json().get("data", {})
-                
-                # CPU Calculation
-                cpu_value = data.get("cpu", 0)
-                vcpus = data.get("cpus", 1)  # Default to 1 if missing
-                cpu_percentage = round(cpu_value * 100 * vcpus, 2)
+
+                # CPU Calculation (No need to multiply by vcpus)
+                cpu_percentage = round(data.get("cpu", 0) * 100, 2)
 
                 # RAM Calculation
                 ram_used = round(data.get("mem", 0) / (1024 * 1024), 2)  # Convert bytes to MB
@@ -58,11 +56,11 @@ class ProxmoxMonitor:
                         log.write(log_entry)
 
                 return usage
-            
+
             else:
                 print(f"[ERROR] Proxmox API returned {response.status_code}")
                 return None
-        
+
         except requests.exceptions.RequestException as e:
             print(f"[ERROR] Connection issue: {e}")
             return None
