@@ -1,73 +1,123 @@
-import socket
-import json
+from fastapi import FastAPI, Request
+from starlette.responses import Response, JSONResponse
+import uvicorn
+import httpx
 
-# Configurações do balanceador
+# Lista de servidores, cada um com "host", "port" e "weight".
 SERVERS = [
-    ("192.168.1.2", 8080),  # Servidor 1
-    ("192.168.2.2", 8080),  # Servidor 2
+    {"host": "192.168.1.2", "port": 8080, "weight": 1},
+    {"host": "192.168.2.2", "port": 8080, "weight": 1},
 ]
 
-# Configuração do balanceador
-LB_HOST = "0.0.0.0"  # Escuta em todas as interfaces
-LB_PORT = 8080       # Porta do balanceador
+LB_HOST = "0.0.0.0"
+LB_PORT = 8080
 
-# Índice para round-robin
+servers_weighted_list = []
 server_index = 0
 
+app = FastAPI()
 
-def forward_request(client_socket):
+
+def build_weighted_list(servers):
+    expanded = []
+    for srv in servers:
+        weight = srv.get("weight", 1)
+        expanded.extend([srv] * weight)
+    return expanded
+
+
+def get_next_server():
     global server_index
+    if not servers_weighted_list:
+        return None
+    server = servers_weighted_list[server_index]
+    server_index = (server_index + 1) % len(servers_weighted_list)
+    return server
 
-    # Seleciona o servidor baseado no índice atual (round-robin)
-    server_addr = SERVERS[server_index]
-    server_index = (server_index + 1) % len(SERVERS)  # Atualiza o índice
+
+@app.get("/admin/config")
+def get_config():
+    return {"servers": SERVERS}
+
+
+@app.post("/admin/config")
+def update_config(config_data: dict):
+    global SERVERS, servers_weighted_list, server_index
+
+    if "servers" in config_data:
+        SERVERS = config_data["servers"]
+
+    servers_weighted_list = build_weighted_list(SERVERS)
+    server_index = 0
+
+    return {"status": "config_updated", "servers": SERVERS}
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def proxy_request(request: Request, path: str):
+    server = get_next_server()
+    if not server:
+        return JSONResponse({"error": "No servers configured"}, status_code=503)
+
+    target_url = f"http://{server['host']}:{server['port']}/{path}"
+
+    # Extrai dados da requisição original
+    method = request.method
+    headers = dict(request.headers)  # Convertendo para dict para facilitar manipulação
+    content = await request.body()
+    params = dict(request.query_params)  # Query params
+
+    # Remove/ajusta cabeçalhos que não queremos passar diretamente (opcional)
+    # Exemplo: se quiser remover 'host', etc., dependendo da sua necessidade.
+    headers.pop("host", None)
 
     try:
-        # Recebe a requisição do cliente
-        request = client_socket.recv(4096)
-        if not request:
-            print("[INFO] Requisição vazia recebida, fechando conexão.")
-            client_socket.close()
-            return
+        async with httpx.AsyncClient() as client:
+            resp = await client.request(
+                method=method,
+                url=target_url,
+                headers=headers,
+                content=content,
+                params=params
+            )
 
-        # Conecta ao servidor escolhido
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-            server_socket.connect(server_addr)
-            print(f"[INFO] Encaminhando requisição para {server_addr}.")
+        # Reconstrói a resposta para retornar ao cliente
+        # Filtra cabeçalhos "hop-by-hop" (Transfer-Encoding, Connection, etc.) se necessário
+        excluded_headers = {
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "upgrade",
+        }
 
-            # Envia a requisição para o servidor
-            server_socket.sendall(request)
+        response_headers = {
+            k: v
+            for k, v in resp.headers.items()
+            if k.lower() not in excluded_headers
+        }
 
-            # Recebe a resposta do servidor
-            response = server_socket.recv(4096)
-
-            # Retorna a resposta ao cliente
-            client_socket.sendall(response)
-
-    except Exception as e:
-        print(f"[ERRO] Falha ao encaminhar requisição: {e}")
-
-    finally:
-        client_socket.close()
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=response_headers
+        )
+    except httpx.RequestError as e:
+        return JSONResponse(
+            {"error": f"Failed to connect to upstream server: {e}"},
+            status_code=502
+        )
 
 
 def start_load_balancer():
-    # Cria o socket do balanceador
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as lb_socket:
-        lb_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        lb_socket.bind((LB_HOST, LB_PORT))
-        lb_socket.listen(5)
-        print(f"[INFO] Load Balancer escutando em {LB_HOST}:{LB_PORT}")
-
-        while True:
-            # Aceita conexão do cliente
-            client_socket, client_addr = lb_socket.accept()
-            print(f"[INFO] Conexão recebida de {client_addr}")
-
-            # Processa a requisição e repassa ao servidor
-            forward_request(client_socket)
+    global servers_weighted_list
+    servers_weighted_list = build_weighted_list(SERVERS)
+    uvicorn.run(app, host=LB_HOST, port=LB_PORT)
 
 
 if __name__ == "__main__":
     start_load_balancer()
-
