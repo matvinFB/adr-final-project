@@ -2,6 +2,7 @@ import asyncio
 import httpx
 import time
 import json
+import random
 from statistics import mean
 
 class LoadTester:
@@ -22,8 +23,13 @@ class LoadTester:
     async def send_request(self):
         """Envia uma requisição ao servidor alvo e mede o tempo de resposta."""
         request_start_time = time.time()
+        difficulty = int(max(1000, min(5000, random.gauss(3000, 800))))  # Distribuição normal entre 1000 e 5000
+        
         try:
-            response = await self.client.get(f"{self.base_url}/test")
+            response = await self.client.post(
+                f"{self.base_url}/test",
+                json={"difficulty": difficulty}
+            )
             request_end_time = time.time()
             latency = request_end_time - request_start_time
             
@@ -38,6 +44,7 @@ class LoadTester:
                 "server_start": server_start_time,
                 "server_end": server_end_time,
                 "latency": latency,
+                "difficulty": difficulty,
                 "result": result,
                 "status": response.status_code
             }
