@@ -5,8 +5,8 @@ import httpx
 
 # Lista de servidores, cada um com "host", "port" e "weight".
 SERVERS = [
-    {"host": "192.168.1.2", "port": 8080, "weight": 1},
-    {"host": "192.168.2.2", "port": 8080, "weight": 1},
+    {"host": "192.168.1.2", "port": 8080, "weight": 1, "id": 1},
+    {"host": "192.168.2.2", "port": 8080, "weight": 1, "id": 2},
 ]
 
 LB_HOST = "0.0.0.0"
@@ -60,20 +60,21 @@ async def proxy_request(request: Request, path: str):
         return JSONResponse({"error": "No servers configured"}, status_code=503)
 
     target_url = f"http://{server['host']}:{server['port']}/{path}"
-
-    # Extrai dados da requisição original
     method = request.method
-    headers = dict(request.headers)  # Convertendo para dict para facilitar manipulação
-    content = await request.body()
-    params = dict(request.query_params)  # Query params
+    headers = dict(request.headers)
+    params = dict(request.query_params)
 
-    # Remove/ajusta cabeçalhos que não queremos passar diretamente (opcional)
-    # Exemplo: se quiser remover 'host', etc., dependendo da sua necessidade.
     headers.pop("host", None)
+
+    # Captura erro de desconexão do cliente
+    try:
+        content = await request.body()
+    except starlette.requests.ClientDisconnect:
+        return JSONResponse({"error": "Client disconnected before sending body"}, status_code=400)
 
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.request(
+            response = await client.request(
                 method=method,
                 url=target_url,
                 headers=headers,
@@ -81,36 +82,20 @@ async def proxy_request(request: Request, path: str):
                 params=params
             )
 
-        # Reconstrói a resposta para retornar ao cliente
-        # Filtra cabeçalhos "hop-by-hop" (Transfer-Encoding, Connection, etc.) se necessário
-        excluded_headers = {
-            "content-length",
-            "transfer-encoding",
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "upgrade",
-        }
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError:
+            response_data = {"error": "Invalid JSON response from server"}
 
-        response_headers = {
-            k: v
-            for k, v in resp.headers.items()
-            if k.lower() not in excluded_headers
-        }
+        response_data["server_id"] = server["id"]
+        return JSONResponse(content=response_data, status_code=response.status_code)
 
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=response_headers
-        )
     except httpx.RequestError as e:
         return JSONResponse(
-            {"error": f"Failed to connect to upstream server: {e}"},
+            {"error": f"Failed to connect to upstream server: {e}", "server_id": server["id"]},
             status_code=502
         )
+
 
 
 def start_load_balancer():

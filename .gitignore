@@ -1,1 +1,4 @@
 client/.env
+client/logs/
+*.pyc
+*.pem

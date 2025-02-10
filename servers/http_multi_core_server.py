@@ -1,108 +1,66 @@
 #!/usr/bin/env python3
-
-import http.server
-import socketserver
-import os
-import json
+import asyncio
 import time
 import hashlib
+import os
 import socket
 from concurrent.futures import ProcessPoolExecutor
 
-# Get the hostname and IP of the server
-HOSTNAME = socket.gethostname()
-IP_ADDRESS = socket.gethostbyname(HOSTNAME)
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-# Descobrindo quantidade de núcleos disponível
+# Setup FastAPI and the process pool
+app = FastAPI()
 NUM_CORES = os.cpu_count()
-
-# Cria um pool de processos global
 pool = ProcessPoolExecutor(max_workers=NUM_CORES)
 
+# Data model for the request
+class HashRequest(BaseModel):
+    difficulty: int
+
+# CPU-bound proof-of-work function
 def do_hashing(difficulty: int) -> str:
     """
-    Executa 'difficulty' rodadas de hashing de uma string fixa.
-    Retorna o hash final como string em hexadecimal.
+    Performs a proof-of-work style hash computation.
+    
+    Instead of a fixed number of hash iterations, this function finds a nonce such that
+    the SHA-512 hash of (data + nonce) starts with a number of zeros equal to the difficulty.
+    Increasing difficulty exponentially increases the CPU work required.
     """
     data = b"Hello, World!"
-    current_hash = data
+    nonce = 0
+    target_prefix = "0" * difficulty  # e.g., if difficulty == 4, target_prefix = "0000"
+    
+    while True:
+        # Convert nonce to bytes and combine with data
+        combined = data + str(nonce).encode()
+        # Compute the SHA-512 hash
+        hash_result = hashlib.sha512(combined).hexdigest()
+        # Check if the hash meets the difficulty (i.e., has the required number of leading zeros)
+        if hash_result.startswith(target_prefix):
+            # Return both the nonce and the resulting hash for verification
+            return f"Nonce: {nonce}, Hash: {hash_result}"
+        nonce += 1
 
-    for _ in range(difficulty):
-        # Calcula o hash do valor atual
-        current_hash = hashlib.sha512(current_hash).digest()
-
-    # Converte o hash final para hexadecimal
-    return current_hash.hex()
-
-
-class MultiCoreRequestHandler(http.server.BaseHTTPRequestHandler):
-    """
-    Handler responsável por receber requisições POST contendo JSON:
-      { "difficulty": <int> }
-
-    Responde com JSON:
-      {
-        "start_time": <timestamp>,
-        "end_time": <timestamp>,
-        "result": <hash_final>
-      }
-    """
-
-    def do_POST(self):
-        # Lê o conteúdo do POST
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length)
-
-        # Parse do JSON recebido
-        try:
-            data = json.loads(post_data)
-            difficulty = data.get("difficulty", 1)
-        except (json.JSONDecodeError, TypeError):
-            self.send_error(400, "JSON inválido ou ausência de campo 'difficulty'")
-            return
-
-        # Marca o início da tarefa
-        start_time = time.time()
-
-        # Envia a tarefa para o Pool de Processos
-        future = pool.submit(do_hashing, difficulty)
-
-        # Aguarda o resultado
-        result = future.result()
-
-        # Marca o fim da tarefa
-        end_time = time.time()
-
-        # Monta o JSON de resposta
-        response = {
-                "start_time": start_time,
-                "end_time": end_time,
-                "result": result,
-                "server": HOSTNAME
-            }
-        response_json = json.dumps(response)
-
-        # Envia resposta
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(response_json.encode("utf-8"))
-
-
-def run_server(port=8080):
-    """
-    Inicia o servidor em todas as interfaces (0.0.0.0) na porta especificada.
-    """
-    with socketserver.TCPServer(("0.0.0.0", port), MultiCoreRequestHandler) as httpd:
-        print(f"Servidor ouvindo em http://0.0.0.0:{port}")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("Encerrando servidor...")
-        finally:
-            httpd.server_close()
-
+# Asynchronous endpoint that offloads the CPU-bound task to the process pool
+@app.post("/hash")
+async def hash_endpoint(request: HashRequest):
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+    # Offload CPU-bound task to the process pool
+    try:
+        result = await loop.run_in_executor(pool, do_hashing, request.difficulty)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    end_time = time.time()
+    hostname = socket.gethostname()
+    return {
+        "start_time": start_time,
+        "end_time": end_time,
+        "result": result,
+        "server": hostname
+    }
 
 if __name__ == "__main__":
-    run_server(port=8080)
-
+    import uvicorn
+    uvicorn.run("http_multi_core_server:app", host="0.0.0.0", port=8080, log_level="info", workers=NUM_CORES)
