@@ -41,16 +41,18 @@ class LoadTester:
                 response_data = response.json()
             except json.JSONDecodeError:
                 response_data = {"error": "Invalid JSON response"}
+
+            latency_on_server = response_data.get("end_time", 0) - response_data.get("start_time", 0)
             
             with self.lock:
                 self.results.append({
                     "request_sent": request_start_time,
                     "request_received": request_end_time,
                     "latency": latency,
+                    "latency_on_server": latency_on_server,
                     "difficulty": difficulty,
-                    "result": response_data.get("result"),
                     "status": response.status_code,
-                    "server_id": response_data.get("server_id")
+                    "server": response_data.get("server")
                 })
         except requests.RequestException as e:
             with self.lock:

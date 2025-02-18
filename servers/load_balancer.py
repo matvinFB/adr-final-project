@@ -1,9 +1,14 @@
 from fastapi import FastAPI, Request
-from starlette.responses import Response, JSONResponse
+from starlette.responses import JSONResponse
 import uvicorn
 import httpx
+import redis
+import json
 
-# Lista de servidores, cada um com "host", "port" e "weight".
+# Configuração do Redis
+redis_client = redis.Redis(host="localhost", port=6379, db=0)
+
+# Lista de servidores, cada um com "host", "port", "weight" e "id".
 SERVERS = [
     {"host": "192.168.1.2", "port": 8080, "weight": 1, "id": 1},
     {"host": "192.168.2.2", "port": 8080, "weight": 1, "id": 2},
@@ -12,12 +17,7 @@ SERVERS = [
 LB_HOST = "0.0.0.0"
 LB_PORT = 8080
 
-servers_weighted_list = []
-server_index = 0
-
-app = FastAPI()
-
-
+# Gerar uma lista expandida de servidores baseada no peso
 def build_weighted_list(servers):
     expanded = []
     for srv in servers:
@@ -25,14 +25,20 @@ def build_weighted_list(servers):
         expanded.extend([srv] * weight)
     return expanded
 
+servers_weighted_list = build_weighted_list(SERVERS)
+
+app = FastAPI()
+
 
 def get_next_server():
-    global server_index
     if not servers_weighted_list:
         return None
-    server = servers_weighted_list[server_index]
-    server_index = (server_index + 1) % len(servers_weighted_list)
-    return server
+    # Incrementa de forma atômica o contador no Redis.
+    index = redis_client.incr("server_index") - 1
+    # Se o índice ficar muito alto, opcionalmente podemos resetá-lo.
+    total_servers = len(servers_weighted_list)
+    index = index % total_servers
+    return servers_weighted_list[index]
 
 
 @app.get("/admin/config")
@@ -42,14 +48,14 @@ def get_config():
 
 @app.post("/admin/config")
 def update_config(config_data: dict):
-    global SERVERS, servers_weighted_list, server_index
+    global SERVERS, servers_weighted_list
 
     if "servers" in config_data:
         SERVERS = config_data["servers"]
 
     servers_weighted_list = build_weighted_list(SERVERS)
-    server_index = 0
-
+    # Opcional: reseta o contador no Redis quando a configuração é atualizada.
+    redis_client.set("server_index", 0)
     return {"status": "config_updated", "servers": SERVERS}
 
 
@@ -66,10 +72,9 @@ async def proxy_request(request: Request, path: str):
 
     headers.pop("host", None)
 
-    # Captura erro de desconexão do cliente
     try:
         content = await request.body()
-    except starlette.requests.ClientDisconnect:
+    except Exception as e:
         return JSONResponse({"error": "Client disconnected before sending body"}, status_code=400)
 
     try:
@@ -97,10 +102,7 @@ async def proxy_request(request: Request, path: str):
         )
 
 
-
 def start_load_balancer():
-    global servers_weighted_list
-    servers_weighted_list = build_weighted_list(SERVERS)
     uvicorn.run(app, host=LB_HOST, port=LB_PORT)
 
 

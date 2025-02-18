@@ -1,4 +1,7 @@
 import asyncio
+import time
+import json
+import httpx
 import os
 import multiprocessing
 import shutil
@@ -37,7 +40,17 @@ def clear_logs():
 def start_monitoring(vm_id, log_file, duration):
     """Inicia o monitoramento em um processo separado."""
     monitor = ProxmoxMonitor(PROXMOX_IP, PROXMOX_TOKEN, NODE, vm_id, log_file)
-    monitor.monitor(interval=1//5, duration=duration)
+    monitor.monitor(interval=1, duration=duration + 4)
+
+def merge_logs(scenario_name):
+    """Une os logs dos processos ao final do cenário."""
+    log_proc0 = f"logs/{scenario_name}-proc0-requests.txt"
+    log_proc1 = f"logs/{scenario_name}-proc1-requests.txt"
+    
+    if os.path.exists(log_proc1):
+        with open(log_proc1, "r") as f1, open(log_proc0, "a") as f0:
+            f0.write(f1.read())
+        os.remove(log_proc1)
 
 def run_load_test_process(process_num, base_url, rps, duration, scenario_name):
     """Executa o teste de carga em um processo separado."""
@@ -45,30 +58,10 @@ def run_load_test_process(process_num, base_url, rps, duration, scenario_name):
     tester = LoadTester(base_url=base_url, rps=rps, duration=duration, log_file=log_request_file)
     tester.run()
 
-import requests
-
-async def set_load_balancer_config(algorithm, cores_server2):
-    """Atualiza a configuração do Load Balancer"""
-    servers_config = [
-        {"host": "192.168.1.2", "port": 8080, "weight": SERVER_1_CORES, "id": 1},
-        {"host": "192.168.2.2", "port": 8080, "weight": cores_server2, "id": 2}
-    ]
-
-    if algorithm == "round_robin":
-        servers_config = [{"host": s["host"], "port": s["port"], "weight": 1, "id": s["id"]} for s in servers_config]
-    
-    try:
-        response = requests.post(f"{LB_URL}/admin/config", json={"servers": servers_config}, timeout=10.0)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        error_message = f"Error: {e}, Status Code: {getattr(e.response, 'status_code', 'N/A')}"
-        print(error_message)
-
 async def run_experiment():
-    clear_logs()  # Limpa todos os logs antes de iniciar o experimento
+    clear_logs()
     previous_cores = None
     vm_manager = ProxmoxVMManager(PROXMOX_IP, PROXMOX_TOKEN, NODE, VM_ID_2, VM_IP_2)
-    await asyncio.sleep(5)
     
     for cores in CORE_LEVELS:
         if previous_cores != cores:
@@ -84,12 +77,9 @@ async def run_experiment():
                 
                 print(f"\n=== Executando cenário: {scenario_name} ===")
 
-                # Configurar Load Balancer
-                await set_load_balancer_config(algorithm, cores)
-
                 # Iniciar monitoramento em processos separados
-                monitor_process_1 = multiprocessing.Process(target=start_monitoring, args=(VM_ID_1, log_monitor_file_1, EXPERIMENT_DURATION+20))
-                monitor_process_2 = multiprocessing.Process(target=start_monitoring, args=(VM_ID_2, log_monitor_file_2, EXPERIMENT_DURATION+20))
+                monitor_process_1 = multiprocessing.Process(target=start_monitoring, args=(VM_ID_1, log_monitor_file_1, EXPERIMENT_DURATION+5))
+                monitor_process_2 = multiprocessing.Process(target=start_monitoring, args=(VM_ID_2, log_monitor_file_2, EXPERIMENT_DURATION+5))
                 monitor_process_1.start()
                 monitor_process_2.start()
                 
@@ -107,6 +97,9 @@ async def run_experiment():
                 
                 for p in processes:
                     p.join()
+                
+                # Unificar logs dos processos ao final do cenário
+                merge_logs(scenario_name)
 
                 # Esperar monitoramento terminar
                 monitor_process_1.join()
