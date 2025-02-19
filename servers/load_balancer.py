@@ -1,12 +1,9 @@
-from fastapi import FastAPI, Request
-from starlette.responses import JSONResponse
-import uvicorn
+from sanic import Sanic, response
+from sanic.request import Request
 import httpx
-import redis
 import json
 
-# Configuração do Redis
-redis_client = redis.Redis(host="localhost", port=6379, db=0)
+app = Sanic("LoadBalancer")
 
 # Lista de servidores, cada um com "host", "port", "weight" e "id".
 SERVERS = [
@@ -14,10 +11,8 @@ SERVERS = [
     {"host": "192.168.2.2", "port": 8080, "weight": 1, "id": 2},
 ]
 
-LB_HOST = "0.0.0.0"
-LB_PORT = 8080
+server_index = 0
 
-# Gerar uma lista expandida de servidores baseada no peso
 def build_weighted_list(servers):
     expanded = []
     for srv in servers:
@@ -27,84 +22,78 @@ def build_weighted_list(servers):
 
 servers_weighted_list = build_weighted_list(SERVERS)
 
-app = FastAPI()
-
-
 def get_next_server():
+    global server_index, servers_weighted_list
     if not servers_weighted_list:
         return None
-    # Incrementa de forma atômica o contador no Redis.
-    index = redis_client.incr("server_index") - 1
-    # Se o índice ficar muito alto, opcionalmente podemos resetá-lo.
-    total_servers = len(servers_weighted_list)
-    index = index % total_servers
-    return servers_weighted_list[index]
+    server = servers_weighted_list[server_index]
+    server_index = (server_index + 1) % len(servers_weighted_list)
+    return server
 
+@app.route("/admin/config", methods=["GET"])
+async def get_config(request: Request):
+    return response.json({"servers": SERVERS})
 
-@app.get("/admin/config")
-def get_config():
-    return {"servers": SERVERS}
-
-
-@app.post("/admin/config")
-def update_config(config_data: dict):
-    global SERVERS, servers_weighted_list
-
+@app.route("/admin/config", methods=["POST"])
+async def update_config(request: Request):
+    global SERVERS, servers_weighted_list, server_index
+    config_data = request.json
     if "servers" in config_data:
         SERVERS = config_data["servers"]
 
     servers_weighted_list = build_weighted_list(SERVERS)
-    # Opcional: reseta o contador no Redis quando a configuração é atualizada.
-    redis_client.set("server_index", 0)
-    return {"status": "config_updated", "servers": SERVERS}
+    server_index = 0
 
+    return response.json({"status": "config_updated", "servers": SERVERS})
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_request(request: Request, path: str):
     server = get_next_server()
     if not server:
-        return JSONResponse({"error": "No servers configured"}, status_code=503)
+        return response.json({"error": "No servers configured"}, status=503)
 
     target_url = f"http://{server['host']}:{server['port']}/{path}"
     method = request.method
-    headers = dict(request.headers)
-    params = dict(request.query_params)
 
+    # Copy headers and remove 'host'
+    headers = dict(request.headers)
     headers.pop("host", None)
 
-    try:
-        content = await request.body()
-    except Exception as e:
-        return JSONResponse({"error": "Client disconnected before sending body"}, status_code=400)
+    # Convert Sanic request.args to a standard dict
+    params = dict(request.args)
+
+    # Request body
+    content = request.body
 
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.request(
+            upstream_response = await client.request(
                 method=method,
                 url=target_url,
                 headers=headers,
+                params=params,
                 content=content,
-                params=params
             )
-
-        try:
-            response_data = response.json()
-        except json.JSONDecodeError:
-            response_data = {"error": "Invalid JSON response from server"}
-
-        response_data["server_id"] = server["id"]
-        return JSONResponse(content=response_data, status_code=response.status_code)
-
     except httpx.RequestError as e:
-        return JSONResponse(
+        return response.json(
             {"error": f"Failed to connect to upstream server: {e}", "server_id": server["id"]},
-            status_code=502
+            status=502,
         )
 
+    try:
+        response_data = upstream_response.json()
+    except json.JSONDecodeError:
+        response_data = {"error": "Invalid JSON response from server"}
 
-def start_load_balancer():
-    uvicorn.run(app, host=LB_HOST, port=LB_PORT)
+    response_data["server_id"] = server["id"]
+    return response.json(response_data, status=upstream_response.status_code)
 
+
+# Para capturar a rota raiz "/"
+@app.route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def root_proxy(request: Request):
+    return await proxy_request(request, path="")
 
 if __name__ == "__main__":
-    start_load_balancer()
+    # Rodando com um único worker
+    app.run(host="0.0.0.0", port=8080, workers=1)

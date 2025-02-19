@@ -23,7 +23,7 @@ VM_IP_2 = os.getenv("VM_IP_2")  # IP da VM 2 para checagem de serviço
 LB_URL = os.getenv("LB_URL")
 SERVER_1_CORES = 1
 EXPERIMENT_DURATION = int(os.getenv("EXPERIMENT_DURATION", 30))
-MAX_RPS_PER_PROCESS = 100
+MAX_RPS_PER_PROCESS = 10
 
 # Definição dos fatores
 RPS_LEVELS = list(map(int, os.getenv("RPS_LEVELS", "100,1000,10000").split(',')))
@@ -45,18 +45,36 @@ def start_monitoring(vm_id, log_file, duration):
 def merge_logs(scenario_name):
     """Une os logs dos processos ao final do cenário."""
     log_proc0 = f"logs/{scenario_name}-proc0-requests.txt"
-    log_proc1 = f"logs/{scenario_name}-proc1-requests.txt"
-    
-    if os.path.exists(log_proc1):
-        with open(log_proc1, "r") as f1, open(log_proc0, "a") as f0:
-            f0.write(f1.read())
-        os.remove(log_proc1)
+    for i in range(1, 10):  # Merge dos arquivos proc1, proc2 e proc3 no proc0
+        log_procN = f"logs/{scenario_name}-proc{i}-requests.txt"
+        if os.path.exists(log_procN):
+            with open(log_procN, "r") as f_in, open(log_proc0, "a") as f_out:
+                f_out.write(f_in.read())
+            os.remove(log_procN)
 
 def run_load_test_process(process_num, base_url, rps, duration, scenario_name):
     """Executa o teste de carga em um processo separado."""
     log_request_file = f"logs/{scenario_name}-proc{process_num}-requests.txt"
     tester = LoadTester(base_url=base_url, rps=rps, duration=duration, log_file=log_request_file)
     tester.run()
+
+async def set_load_balancer_config(algorithm, cores_server2):
+    """Atualiza a configuração do Load Balancer"""
+    servers_config = [
+        {"host": "192.168.1.2", "port": 8080, "weight": SERVER_1_CORES, "id": 1},
+        {"host": "192.168.2.2", "port": 8080, "weight": cores_server2, "id": 2}
+    ]
+
+    if algorithm == "round_robin":
+        servers_config = [{"host": s["host"], "port": s["port"], "weight": 1, "id": s["id"]} for s in servers_config]
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(f"{LB_URL}/admin/config", json={"servers": servers_config})
+        if response.status_code == 200:
+            print(f"✔ Load Balancer atualizado com sucesso para {algorithm} com pesos {servers_config}")
+        else:
+            print(f"❌ Erro ao atualizar Load Balancer: {response.status_code} - {response.text}")
+
 
 async def run_experiment():
     clear_logs()
@@ -69,11 +87,15 @@ async def run_experiment():
             vm_manager.update_vm_cores(cores)
             previous_cores = cores
 
+            await asyncio.sleep(10)
+
         for rps in RPS_LEVELS:
             for algorithm in ALGORITHMS:
                 scenario_name = f"rps{rps}-cores{cores}-alg{algorithm}"
                 log_monitor_file_1 = f"logs/{scenario_name}-vm1-monitoring.txt"
                 log_monitor_file_2 = f"logs/{scenario_name}-vm2-monitoring.txt"
+
+                await set_load_balancer_config(algorithm, cores)
                 
                 print(f"\n=== Executando cenário: {scenario_name} ===")
 
