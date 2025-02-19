@@ -55,7 +55,7 @@ def merge_logs(scenario_name):
 def run_load_test_process(process_num, base_url, rps, duration, scenario_name):
     """Executa o teste de carga em um processo separado."""
     log_request_file = f"logs/{scenario_name}-proc{process_num}-requests.txt"
-    tester = LoadTester(base_url=base_url, rps=rps, duration=duration, log_file=log_request_file)
+    tester = LoadTester(base_url=base_url, duration=duration, log_file=log_request_file)
     tester.run()
 
 async def set_load_balancer_config(algorithm, cores_server2):
@@ -87,7 +87,7 @@ async def run_experiment():
             vm_manager.update_vm_cores(cores)
             previous_cores = cores
 
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
         for rps in RPS_LEVELS:
             for algorithm in ALGORITHMS:
